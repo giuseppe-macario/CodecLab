@@ -1,0 +1,143 @@
+# Genera la documentazione di CodecLab con DocC e la pubblica su GitHub Pages,
+# e compila l'app e la pubblica come Release del repository, da scaricare.
+#
+# Parte solo a mano: scheda Actions › Documentazione e app › Run workflow,
+# scegliendo che cosa fare con le due caselle.
+# Prima volta: Settings › Pages › Build and deployment › Source: «GitHub Actions».
+
+name: Documentazione e app
+
+on:
+  workflow_dispatch:
+    inputs:
+      documentazione:
+        description: "Genera e pubblica la documentazione"
+        type: boolean
+        default: true
+      app:
+        description: "Compila l'app e pubblicala come Release"
+        type: boolean
+        default: true
+      versione:
+        description: "Versione della Release (per esempio 1.0); vuoto per usare la data"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------- Documentazione
+
+  build:
+    name: Genera la documentazione
+    if: inputs.documentazione
+    # Il progetto usa il formato di Xcode 27 (project.xcproj): serve l'immagine con Xcode 27,
+    # non quella di macOS 26, che ha Xcode 26 e cerca il vecchio project.pbxproj.
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Versione di Xcode
+        run: xcodebuild -version
+
+      - name: Compila la documentazione
+        run: |
+          xcodebuild docbuild \
+            -project CodecLab.xcodeproj \
+            -scheme CodecLab \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Prepara il sito
+        run: |
+          ARCHIVE=$(find build -type d -name 'CodecLab.doccarchive' | head -1)
+          REPO="${GITHUB_REPOSITORY#*/}"
+          "$(xcrun --find docc)" process-archive transform-for-static-hosting "$ARCHIVE" \
+            --output-path site \
+            --hosting-base-path "$REPO"
+          # La pagina principale del sito porta direttamente alla documentazione.
+          echo '<!DOCTYPE html><meta http-equiv="refresh" content="0; url=documentation/codeclab/">' > site/index.html
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: Pubblica su GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    # Una pubblicazione alla volta; quella in corso non viene interrotta.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}documentation/codeclab/
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # ---------------------------------------------------------------- App
+
+  app:
+    name: Compila e pubblica l'app
+    if: inputs.app
+    runs-on: xcode-27
+    # Creare una Release richiede il permesso di scrittura sul repository.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Versione di Xcode
+        run: xcodebuild -version
+
+      # Firma «ad hoc» (identità "-"): senza un certificato Apple Developer l'app non si può firmare
+      # a nome di uno sviluppatore, ma sui Mac con chip Apple una firma, anche ad hoc, è obbligatoria.
+      - name: Compila CodecLab (Release)
+        run: |
+          xcodebuild build \
+            -project CodecLab.xcodeproj \
+            -scheme CodecLab \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM=
+
+      # ditto conserva la struttura e gli attributi del pacchetto .app, che uno zip normale può rovinare.
+      - name: Comprimi l'app
+        run: |
+          ditto -c -k --keepParent build/Build/Products/Release/CodecLab.app CodecLab.zip
+
+      # La Release è pubblica e permanente: la si trova nella pagina del repository, sotto «Releases».
+      - name: Pubblica la Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSIONE: ${{ inputs.versione }}
+        run: |
+          if [ -n "$VERSIONE" ]; then
+            TAG="v$VERSIONE"
+          else
+            TAG="v$(date +%Y.%m.%d)-$GITHUB_RUN_NUMBER"
+          fi
+
+          cat > note.md <<'NOTE'
+          CodecLab compilato da GitHub Actions con Xcode 27.
+
+          **Requisiti:** macOS 26 o successivo su un Mac con chip Apple Silicon, e FFmpeg di Homebrew (`brew install ffmpeg`). \
+          Se Apple Intelligence è attiva in macOS, l'app userà anche il modello linguistico di Apple.
+
+          **Primo avvio:** poiché l'app compilata da GitHub Actions non ha una firma validata da Apple, macOS la blocca. \
+          Per sbloccare l'app: lanciarla una volta, poi in **Impostazioni di Sistema › Privacy e sicurezza** scegliere **Apri comunque**.
+          NOTE
+
+          gh release create "$TAG" CodecLab.zip \
+            --title "CodecLab $TAG" \
+            --notes-file note.md \
+            --target "$GITHUB_SHA"
